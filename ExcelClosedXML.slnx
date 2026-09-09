@@ -1,0 +1,9 @@
+<Solution>
+  <Project Path="ExcelClosedXML/ExcelClosedXML.Droid/ExcelClosedXML.Droid.csproj">
+    <Deploy />
+  </Project>
+  <Project Path="ExcelClosedXML/ExcelClosedXML.WinUI/ExcelClosedXML.WinUI.csproj">
+    <Platform Project="x64" />
+  </Project>
+  <Project Path="ExcelClosedXML/ExcelClosedXML/ExcelClosedXML.csproj" />
+</Solution>

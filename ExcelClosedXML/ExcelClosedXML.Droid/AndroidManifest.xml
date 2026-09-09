@@ -1,0 +1,25 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.companyname.excelclosedxml" android:versionCode="1" android:versionName="1.0">
+	<application android:allowBackup="true" android:icon="@drawable/ico" android:roundIcon="@drawable/ico" android:label="@string/app_name" android:supportsRtl="true" android:requestLegacyExternalStorage="true">
+
+		<!-- FileProvider pour partager les fichiers .tag avec des applications tierces (Android 7+) -->
+		<provider
+			android:name="androidx.core.content.FileProvider"
+			android:authorities="com.companyname.excelclosedxml.fileprovider"
+			android:exported="false"
+			android:grantUriPermissions="true">
+			<meta-data
+				android:name="android.support.FILE_PROVIDER_PATHS"
+				android:resource="@xml/file_paths" />
+		</provider>
+
+	</application>
+
+	<uses-permission android:name="android.permission.INTERNET" />
+	<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+	<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+	<uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+	<uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+	<uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+	<uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+</manifest>
