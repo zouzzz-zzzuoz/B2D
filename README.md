@@ -1,5 +1,5 @@
 B2D est une application pour Android (.apk).\
-Il s'agit d'un lecteur xlsx pour bon de débit de STECO Industries.\
+C'est un lecteur et partiellement éditeur xlsx pour bon de débit de STECO Industries.\
 Il doit être couplé avec les applications gratuites Apk4Tag et Gestionnaire de fichiers + (Files by Google).\
 \
 \
