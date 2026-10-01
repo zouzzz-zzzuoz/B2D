@@ -66,5 +66,6 @@ namespace ExcelClosedXML
                 IsAnonymous = AnonymousCheckBox.IsChecked,
                // DisplayName = DisplayNameEntry.Text ?? string.Empty
             };
+
     }
 }
