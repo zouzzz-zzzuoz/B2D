@@ -7,6 +7,25 @@
 
     <Grid>
 
+        <HorizontalStackLayout HorizontalOptions="End"
+                               VerticalOptions="Start"
+                               Spacing="8"
+                               Margin="0,18,18,0">
+            <Label Text="SMB, lien fichiers :"
+                   VerticalOptions="Center"
+                   FontFamily="{Binding Source={x:Reference OpenBtn}, Path=FontFamily}"
+                   FontSize="{Binding Source={x:Reference OpenBtn}, Path=FontSize}"
+                   TextColor="HotPink" />
+
+            <Button Text="⚙"
+                    Clicked="OnSmbSettingsClicked"
+                    FontSize="24"
+                    WidthRequest="54"
+                    HeightRequest="54"
+                    Padding="0"
+                    SemanticProperties.Description="Paramètres SMB" />
+        </HorizontalStackLayout>
+
         <!-- Contenu centré -->
         <VerticalStackLayout Padding="30,20,30,40"
                              Spacing="16"
@@ -38,12 +57,19 @@
         </VerticalStackLayout>
 
         <!-- Texte en bas à droite -->
-        <Label Text="créé par Romu"
-               FontSize="10"
-               TextColor="{StaticResource Primary}"
-               HorizontalOptions="End"
-               VerticalOptions="End"
-               Margin="0,0,10,10" />
+        <VerticalStackLayout Spacing="0"
+                             HorizontalOptions="End"
+                             VerticalOptions="End"
+                             Margin="0,0,10,10">
+            <Label x:Name="BuildInfoLabel"
+                   FontSize="10"
+                   TextColor="{StaticResource Primary}"
+                   HorizontalOptions="End" />
+            <Label Text="créé par Romu"
+                   FontSize="10"
+                   TextColor="{StaticResource Primary}"
+                   HorizontalOptions="End" />
+        </VerticalStackLayout>
 
     </Grid>
 

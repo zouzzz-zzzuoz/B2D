@@ -1,4 +1,6 @@
-﻿using Android.Content;
+﻿using Android.App;
+using Android.Content;
+using Android.OS;
 using Android.Provider;
 using ExcelClosedXML.Services;
 using AndroidApp = Android.App.Application;
@@ -7,6 +9,8 @@ namespace ExcelClosedXML.Droid.Services
 {
     public class AndroidFilePickerService : IFilePickerService
     {
+        private const string FileManagerPackage = "com.alphainventor.filemanager";
+
         public const int RequestCode     = 9877;
         public const int TreeRequestCode = 9878;
 
@@ -17,7 +21,10 @@ namespace ExcelClosedXML.Droid.Services
             MainActivity.FilePickResult += Handler;
 
             var intent = new Intent(Intent.ActionOpenDocument);
+            intent.SetPackage(FileManagerPackage);
             intent.AddCategory(Intent.CategoryOpenable);
+            intent.AddFlags(ActivityFlags.GrantReadUriPermission |
+                            ActivityFlags.GrantPersistableUriPermission);
             intent.SetType("*/*");
             intent.PutExtra(Intent.ExtraMimeTypes, new string[]
             {
@@ -25,7 +32,23 @@ namespace ExcelClosedXML.Droid.Services
                 "application/vnd.ms-excel",
                 "application/octet-stream"
             });
-            Platform.CurrentActivity?.StartActivityForResult(intent, RequestCode);
+
+            var activity = Platform.CurrentActivity;
+            if (activity == null)
+            {
+                await AlertFilePickerUnavailable();
+                return null;
+            }
+
+            try
+            {
+                activity.StartActivityForResult(intent, RequestCode);
+            }
+            catch (ActivityNotFoundException)
+            {
+                await AlertFilePickerUnavailable();
+                return null;
+            }
 
             var resultIntent = await tcs.Task;
             if (resultIntent?.Data == null) return null;
@@ -40,13 +63,21 @@ namespace ExcelClosedXML.Droid.Services
             string? directory = TryResolveDirectory(context, uri);
             TryTakePersistablePermissions(context, uri);
 
+            var treeUri = TryBuildTreeUri(uri);
+            if (treeUri == null)
+            {
+                treeUri = await TryRequestTreeAccessAsync(activity, uri);
+                if (treeUri != null)
+                    TryTakePersistablePermissions(context, treeUri);
+            }
+
             return new ExcelFileInfo
             {
                 FileName          = fileName,
                 Stream            = null,
                 Directory         = directory,
                 SourceDocumentUri = uri.ToString(),
-                TreeUri           = TryBuildTreeUri(uri)?.ToString()
+                TreeUri           = treeUri?.ToString()
             };
         }
 
@@ -59,6 +90,44 @@ namespace ExcelClosedXML.Droid.Services
             }
             catch
             {
+            }
+        }
+
+        private static async Task<Android.Net.Uri?> TryRequestTreeAccessAsync(
+            Activity activity, Android.Net.Uri sourceUri)
+        {
+            try
+            {
+                var tcs = new TaskCompletionSource<Intent?>();
+                void Handler(Intent? data) { MainActivity.TreePickResult -= Handler; tcs.TrySetResult(data); }
+                MainActivity.TreePickResult += Handler;
+
+                var intent = new Intent(Intent.ActionOpenDocumentTree);
+                intent.SetPackage(FileManagerPackage);
+                intent.AddFlags(ActivityFlags.GrantReadUriPermission |
+                                ActivityFlags.GrantWriteUriPermission |
+                                ActivityFlags.GrantPersistableUriPermission |
+                                ActivityFlags.GrantPrefixUriPermission);
+
+                if (Build.VERSION.SdkInt >= BuildVersionCodes.O)
+                    intent.PutExtra(DocumentsContract.ExtraInitialUri, sourceUri);
+
+                try
+                {
+                    activity.StartActivityForResult(intent, TreeRequestCode);
+                }
+                catch
+                {
+                    MainActivity.TreePickResult -= Handler;
+                    return null;
+                }
+
+                var resultIntent = await tcs.Task;
+                return resultIntent?.Data;
+            }
+            catch
+            {
+                return null;
             }
         }
 
@@ -159,6 +228,15 @@ namespace ExcelClosedXML.Droid.Services
                 if (page != null)
                     await page.DisplayAlertAsync("Format non supporte",
                         "Les fichiers .xls ne sont pas supportes par ClosedXML. Convertissez en .xlsx.", "OK");
+            });
+
+        private static Task AlertFilePickerUnavailable()
+            => MainThread.InvokeOnMainThreadAsync(async () =>
+            {
+                var page = Microsoft.Maui.Controls.Application.Current?.Windows.FirstOrDefault()?.Page;
+                if (page != null)
+                    await page.DisplayAlertAsync("Sélecteur indisponible",
+                        "Aucune application de sélection de documents compatible n'est disponible sur cet appareil.", "OK");
             });
     }
 }

@@ -21,47 +21,52 @@ namespace ExcelClosedXML
             int RowSpan,
             bool IsMergedNonMaster);
         // ── Constantes Excel (colonnes 1-based) ──────────────────────────────
-        private const int ColB            = 2;
-        private const int ColC            = 3;
-        private const int ColD            = 4;
-        private const int ColF            = 6;
+        private const int ColB = 2;
+        private const int ColC = 3;
+        private const int ColD = 4;
+        private const int ColF = 6;
         private const int ColDisplayFirst = 2;   // B inclus
-        private const int ColDisplayLast  = 14;  // N inclus
-        private const int ColGStart       = 7;   // G inclus
-        private const int ColMEnd         = 13;  // M inclus
-        private const int ColOExcl        = 15;  // O exclus
-        private const int RowTagMin       = 8;
-        private const int FreezeRow       = 7;   // lignes 1-7 figées
+        private const int ColDisplayLast = 14;  // N inclus
+        private const int ColGStart = 7;   // G inclus
+        private const int ColMEnd = 13;  // M inclus
+        private const int ColOExcl = 15;  // O exclus
+        private const int RowTagMin = 8;
+        private const int FreezeRow = 7;   // lignes 1-7 figées
 
         // ── Limites d'affichage ───────────────────────────────────────────────
-        private const int MaxDisplayRows  = 120;
-        private const double RowHeight    = 32;
+        private const int MaxDisplayRows = 120;
+        private const double RowHeight = 32;
 
         // ── Couleurs ─────────────────────────────────────────────────────────
-        private static readonly Color CellPink      = Color.FromArgb("#FFC0CB");
-        private static readonly Color CellWhite     = Colors.White;
-        private static readonly Color CellHeader    = Color.FromArgb("#EEEEEE");
+        private static readonly Color CellPink = Color.FromArgb("#FFC0CB");
+        private static readonly Color CellWhite = Colors.White;
+        private static readonly Color CellHeader = Color.FromArgb("#EEEEEE");
         private static readonly Color CellBorderClr = Color.FromArgb("#CCCCCC");
+        private static readonly SolidColorBrush CellBorderBrush = new(CellBorderClr);
         private static readonly Color LinkTextColor = Color.FromArgb("#FF2DF4");
-        private static readonly Color PaleYellow    = Color.FromArgb("#FFF9C4");
+        private static readonly Color PaleYellow = Color.FromArgb("#FFF9C4");
 
         // ── État ─────────────────────────────────────────────────────────────
         private readonly ITagFileOpener _tagFileOpener;
         private readonly IWorkbookStorageService _workbookStorageService;
-        private XLWorkbook?   _workbook;
+        private XLWorkbook? _workbook;
         private IXLWorksheet? _worksheet;
         private ExcelFileInfo? _fileInfo;
 
-        private readonly HashSet<(int row, int col)>            _pinkCells   = [];
+        private readonly HashSet<(int row, int col)> _pinkCells = [];
         private readonly Dictionary<(int row, int col), Border> _cellBorders = [];
         private readonly SemaphoreSlim _saveLock = new(1, 1);
-        private CancellationTokenSource? _autoSaveCts;
         private MemoryStream? _workbookStream;
         private int _frozenBoundaryRow; // dernière ligne Excel de la zone figée
+        private bool _isLoading;
+        private int _hasPendingChanges;
+        private static WeakReference<SpreadsheetPage>? _activeInstance;
 
         // Debounce pour éviter les clics multiples rapides : performance sur Android
         private readonly Dictionary<(int row, int col), DateTime> _lastCellClickTime = new();
         private const int DebounceMsAndroid = 150; // Délai minimal entre deux clics sur la même cellule (Android)
+
+        private static void Log(string message) => AppLog.Write(message);
 
         public SpreadsheetPage(ITagFileOpener tagFileOpener, IWorkbookStorageService workbookStorageService)
         {
@@ -74,18 +79,29 @@ namespace ExcelClosedXML
         protected override async void OnAppearing()
         {
             base.OnAppearing();
+            _activeInstance = new WeakReference<SpreadsheetPage>(this);
+
             var info = NavigationData.PendingFile;
-            if (info == null) return;
+            if (info == null || _isLoading) return;
 
             NavigationData.PendingFile = null;
             _fileInfo = info;
 
-            await LoadSpreadsheetAsync(info);
+            _isLoading = true;
+            try
+            {
+                await LoadSpreadsheetAsync(info);
+            }
+            finally
+            {
+                _isLoading = false;
+            }
         }
 
         protected override void OnDisappearing()
         {
             base.OnDisappearing();
+            _ = SavePendingChangesAsync();
         }
 
         // Optimisation Android : débounce pour éviter les clics multiples rapides
@@ -93,11 +109,58 @@ namespace ExcelClosedXML
         {
             var key = (row, col);
             var now = DateTime.UtcNow;
-            if (_lastCellClickTime.TryGetValue(key, out var lastTime) && 
+            if (_lastCellClickTime.TryGetValue(key, out var lastTime) &&
                 (now - lastTime).TotalMilliseconds < DebounceMsAndroid)
                 return false;
             _lastCellClickTime[key] = now;
             return true;
+        }
+
+        public static Task SaveCurrentWorkbookIfNeededAsync()
+        {
+            if (_activeInstance != null && _activeInstance.TryGetTarget(out var page))
+                return page.SavePendingChangesAsync();
+
+            Log("SaveCurrentWorkbookIfNeededAsync: _activeInstance introuvable (page fermée/GC) -> no-op");
+            return Task.CompletedTask;
+        }
+
+        private void MarkWorkbookDirty()
+        {
+            Interlocked.Exchange(ref _hasPendingChanges, 1);
+            Log("MarkWorkbookDirty() appelé -> _hasPendingChanges = 1");
+        }
+
+        private async Task SavePendingChangesAsync()
+        {
+            Log($"SavePendingChangesAsync() appelé, flag avant reset = {_hasPendingChanges}");
+
+            if (Interlocked.CompareExchange(ref _hasPendingChanges, 0, 1) == 0)
+            {
+                Log("Aucun changement en attente -> sortie immédiate (pas de sauvegarde)");
+                return;
+            }
+
+            Log("Changements détectés -> appel de SaveWorkbookAsync()");
+
+            try
+            {
+                var savedPath = await SaveWorkbookAsync();
+                if (string.IsNullOrWhiteSpace(savedPath))
+                {
+                    Log("SaveWorkbookAsync() a retourné null/vide -> échec, on remet le flag à 1");
+                    Interlocked.Exchange(ref _hasPendingChanges, 1);
+                }
+                else
+                {
+                    Log($"Sauvegarde réussie -> {savedPath}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"EXCEPTION dans SaveWorkbookAsync() : {ex}");
+                Interlocked.Exchange(ref _hasPendingChanges, 1);
+            }
         }
 
         private static void AdjustHeaderRowHeights(Grid grid)
@@ -142,7 +205,7 @@ namespace ExcelClosedXML
 
 
 
-            
+
         }
 
         private static void ApplyHeaderRowColors(Grid grid)
@@ -216,15 +279,19 @@ namespace ExcelClosedXML
         // ── Chargement principal (3 étapes bien séparées) ────────────────────
         private async Task LoadSpreadsheetAsync(ExcelFileInfo fileInfo)
         {
-            StatusLabel.Text      = "Ouverture du fichier…";
+            StatusLabel.Text = "Ouverture du fichier…";
             StatusLabel.IsVisible = true;
+            await Task.Yield();
 
             try
             {
                 await using var sourceStream = await _workbookStorageService.OpenReadAsync(fileInfo)
                     ?? throw new InvalidOperationException("Impossible d'ouvrir le fichier Excel sélectionné.");
 
-                var ownedStream = new MemoryStream();
+                var streamCapacity = sourceStream.CanSeek && sourceStream.Length > 0 && sourceStream.Length <= int.MaxValue
+                    ? (int)sourceStream.Length
+                    : 0;
+                var ownedStream = streamCapacity > 0 ? new MemoryStream(streamCapacity) : new MemoryStream();
                 await sourceStream.CopyToAsync(ownedStream);
                 ownedStream.Position = 0;
 
@@ -239,11 +306,18 @@ namespace ExcelClosedXML
                     return (w, w.Worksheet(1));
                 });
 
-                _workbook  = wb;
+                _workbook = wb;
                 _worksheet = ws;
 
                 // ── Étape 2 : extraction des données sur thread de fond ────────
                 StatusLabel.Text = "Lecture des cellules… Attends quelques secondes…";
+
+                // Libère visuellement l'ancienne grille avant reconstruction
+                SpreadsheetScroll.Content = null;
+                FrozenGrid.Children.Clear();
+                FrozenGrid.RowDefinitions.Clear();
+                FrozenGrid.ColumnDefinitions.Clear();
+                await Task.Yield();
 
                 var extracted = await Task.Run(() => ExtractCellData(ws));
 
@@ -258,8 +332,9 @@ namespace ExcelClosedXML
                 //   de layout pendant la boucle. Une seule passe au moment de
                 //   SpreadsheetScroll.Content = grid.
                 StatusLabel.Text = $"Affichage ({extracted.TotalRows} lignes × {extracted.TotalCols} colonnes)…";
+                await Task.Yield();
 
-                var (frozen, scrollable) = BuildGridDetached(extracted);
+                var (frozen, scrollable) = await BuildGridDetachedAsync(extracted);
                 AdjustColumnWidths(frozen);
                 AdjustColumnWidths(scrollable);
                 AdjustHeaderRowHeights(frozen);
@@ -272,10 +347,13 @@ namespace ExcelClosedXML
                     FrozenGrid.ColumnDefinitions.Add(new ColumnDefinition(cd.Width));
                 foreach (var rd in frozen.RowDefinitions)
                     FrozenGrid.RowDefinitions.Add(new RowDefinition(rd.Height));
-                foreach (var child in frozen.Children.Cast<View>().ToList())
+                for (var i = frozen.Children.Count - 1; i >= 0; i--)
                 {
-                    int col  = Grid.GetColumn(child);
-                    int row  = Grid.GetRow(child);
+                    if (frozen.Children[i] is not View child)
+                        continue;
+
+                    int col = Grid.GetColumn(child);
+                    int row = Grid.GetRow(child);
                     int cols = Grid.GetColumnSpan(child);
                     int rows = Grid.GetRowSpan(child);
                     frozen.Remove(child);
@@ -291,7 +369,7 @@ namespace ExcelClosedXML
             }
             catch (Exception ex)
             {
-                StatusLabel.Text      = $"Erreur : {ex.Message}";
+                StatusLabel.Text = $"Erreur : {ex.Message}";
                 StatusLabel.IsVisible = true;
             }
         }
@@ -311,20 +389,20 @@ namespace ExcelClosedXML
                 return new ExtractedData(new CellInfo[0, 0], 1, 1, 0, 0);
 
             int firstRow = used.FirstRow().RowNumber();
-            int lastRow  = Math.Min(used.LastRow().RowNumber(), firstRow + MaxDisplayRows - 1);
+            int lastRow = Math.Min(used.LastRow().RowNumber(), firstRow + MaxDisplayRows - 1);
             int firstCol = ColDisplayFirst;
-            int lastCol  = Math.Min(used.LastColumn().ColumnNumber(), ColDisplayLast);
+            int lastCol = Math.Min(used.LastColumn().ColumnNumber(), ColDisplayLast);
 
             int totalRows = lastRow - firstRow + 1;
             int totalCols = lastCol - firstCol + 1;
-            var cells     = new CellInfo[totalRows, totalCols];
+            var cells = new CellInfo[totalRows, totalCols];
             var mergedLookup = BuildMergedCellLookup(ws, firstRow, lastRow, firstCol, lastCol);
 
             for (int r = firstRow; r <= lastRow; r++)
             {
                 for (int c = firstCol; c <= lastCol; c++)
                 {
-                    var xlCell  = ws.Cell(r, c);
+                    var xlCell = ws.Cell(r, c);
                     string text = GetCellText(xlCell);
 
                     System.Drawing.Color? xlBgColor = null;
@@ -347,16 +425,16 @@ namespace ExcelClosedXML
                     }
                     catch { }
 
-                    bool bold   = false;
+                    bool bold = false;
                     bool italic = false;
-                    try { bold   = xlCell.Style.Font.Bold;   } catch { }
+                    try { bold = xlCell.Style.Font.Bold; } catch { }
                     try { italic = xlCell.Style.Font.Italic; } catch { }
 
                     var hAlign = XLAlignmentHorizontalValues.General;
                     var vAlign = XLAlignmentVerticalValues.Bottom;
                     int textRotation = 0;
-                    try { hAlign       = xlCell.Style.Alignment.Horizontal; } catch { }
-                    try { vAlign       = xlCell.Style.Alignment.Vertical;   } catch { }
+                    try { hAlign = xlCell.Style.Alignment.Horizontal; } catch { }
+                    try { vAlign = xlCell.Style.Alignment.Vertical; } catch { }
                     try { textRotation = xlCell.Style.Alignment.TextRotation; } catch { }
 
                     int colSpan = 1, rowSpan = 1;
@@ -375,7 +453,7 @@ namespace ExcelClosedXML
                     }
 
                     bool isPinkZone = c >= ColGStart && c <= ColMEnd && r >= RowTagMin && !string.IsNullOrWhiteSpace(text);
-                    bool isTagLink  = c == ColB && r >= RowTagMin && !string.IsNullOrWhiteSpace(text);
+                    bool isTagLink = c == ColB && r >= RowTagMin && !string.IsNullOrWhiteSpace(text);
 
                     cells[r - firstRow, c - firstCol] = new CellInfo(
                         text, xlBgColor, xlFontColor,
@@ -395,9 +473,9 @@ namespace ExcelClosedXML
             foreach (var range in ws.MergedRanges)
             {
                 int rangeFirstRow = Math.Max(range.FirstRow().RowNumber(), firstRow);
-                int rangeLastRow  = Math.Min(range.LastRow().RowNumber(), lastRow);
+                int rangeLastRow = Math.Min(range.LastRow().RowNumber(), lastRow);
                 int rangeFirstCol = Math.Max(range.FirstColumn().ColumnNumber(), firstCol);
-                int rangeLastCol  = Math.Min(range.LastColumn().ColumnNumber(), lastCol);
+                int rangeLastCol = Math.Min(range.LastColumn().ColumnNumber(), lastCol);
 
                 if (rangeFirstRow > rangeLastRow || rangeFirstCol > rangeLastCol)
                     continue;
@@ -421,14 +499,15 @@ namespace ExcelClosedXML
         // ── Construction de la grille DÉTACHÉE du ScrollView ────────────────
         //   Avantage : grid.Add() ne déclenche PAS InvalidateMeasure sur le
         //   ScrollView parent → construction O(N) au lieu de O(N²).
-        private (Grid frozen, Grid scrollable) BuildGridDetached(ExtractedData d)
+        private async Task<(Grid frozen, Grid scrollable)> BuildGridDetachedAsync(ExtractedData d)
         {
             _cellBorders.Clear();
             _pinkCells.Clear();
+            _lastCellClickTime.Clear();
 
             // Ligne Excel au-delà de laquelle les lignes défilent
             _frozenBoundaryRow = d.FirstRow + Math.Min(FreezeRow - 1, d.TotalRows - 1);
-            int frozenRowCount    = _frozenBoundaryRow - d.FirstRow + 1; // lignes Excel figées
+            int frozenRowCount = _frozenBoundaryRow - d.FirstRow + 1; // lignes Excel figées
             int scrollableRowCount = d.TotalRows - frozenRowCount;
 
             // ── Largeur de chaque colonne (en unités Star) ─────────────────────
@@ -436,8 +515,8 @@ namespace ExcelClosedXML
             for (int i = 0; i < d.TotalCols; i++)
             {
                 int excelCol = d.FirstCol + i;
-                colWidths[i] = excelCol == ColC      ? 0.5    // C : moitié
-                             : excelCol == ColD      ? 0.8    // D : -20 %
+                colWidths[i] = excelCol == ColC ? 0.5    // C : moitié
+                             : excelCol == ColD ? 0.8    // D : -20 %
                              : (excelCol >= ColGStart && excelCol < ColOExcl) ? 0.425  // G-N : -15% de plus
                              : 1.0;
             }
@@ -455,8 +534,8 @@ namespace ExcelClosedXML
                     continue;
                 }
 
-                // Ligne Excel 7 (FreezeRow) agrandie de 10% supplémentaires
-                double h = excelRow == FreezeRow ? RowHeight * 2.475 : RowHeight;
+                // Ligne Excel 7 (FreezeRow) agrandie pour laisser visibles les en-têtes verticaux G..N
+                double h = excelRow == FreezeRow ? RowHeight * 4.25 : RowHeight;
                 frozen.RowDefinitions.Add(new RowDefinition(h));
             }
             foreach (var w in colWidths)
@@ -469,54 +548,79 @@ namespace ExcelClosedXML
             for (int i = 0; i < scrollableRowCount; i++)
                 scrollable.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
 
+            var colorCache = new Dictionary<int, Color>(32);
+            static Color ConvertColor(System.Drawing.Color? source, Color fallback, Dictionary<int, Color> cache)
+            {
+                if (!source.HasValue)
+                    return fallback;
+
+                var value = source.Value;
+                var argb = value.ToArgb();
+                if (cache.TryGetValue(argb, out var cached))
+                    return cached;
+
+                var created = new Color(value.R / 255f, value.G / 255f, value.B / 255f, value.A / 255f);
+                cache[argb] = created;
+                return created;
+            }
+
+            var yieldFrequency = d.TotalRows >= 90 ? 4 : 10;
+
             // ── Cellules de données ───────────────────────────────────────────
             for (int ri = 0; ri < d.TotalRows; ri++)
             {
-                int excelRow  = d.FirstRow + ri;
+                if (ri > 0 && ri % yieldFrequency == 0)
+                    await Task.Yield();
+
+                int excelRow = d.FirstRow + ri;
                 bool isFrozen = excelRow <= _frozenBoundaryRow;
-                int  gridRow  = isFrozen
+                int gridRow = isFrozen
                     ? ri                    // 0-based dans frozen
                     : (ri - frozenRowCount); // 0-based dans scrollable
 
                 for (int ci = 0; ci < d.TotalCols; ci++)
                 {
                     int excelCol = d.FirstCol + ci;
-                    var info     = d.Cells[ri, ci];
+                    var info = d.Cells[ri, ci];
 
                     if (info.IsMergedNonMaster) continue;
 
-                    Color bgColor = info.ExcelBgColor.HasValue
-                        ? new Color(info.ExcelBgColor.Value.R / 255f,
-                                    info.ExcelBgColor.Value.G / 255f,
-                                    info.ExcelBgColor.Value.B / 255f)
-                        : CellWhite;
+                    Color bgColor = ConvertColor(info.ExcelBgColor, CellWhite, colorCache);
 
-                    Color fontColor = info.FontColor.HasValue
-                        ? new Color(info.FontColor.Value.R / 255f,
-                                    info.FontColor.Value.G / 255f,
-                                    info.FontColor.Value.B / 255f)
-                        : Colors.Black;
+                    Color fontColor = ConvertColor(info.FontColor, Colors.Black, colorCache);
 
                     if (info.IsTagLink) fontColor = LinkTextColor;
 
+                    bool isFRowToggleCell = excelCol == ColF && excelRow >= RowTagMin && !string.IsNullOrWhiteSpace(info.Text);
+                    bool isInteractiveCell = info.IsPinkZone || isFRowToggleCell || info.IsTagLink;
+
                     var border = MakeDataCell(info.Text, bgColor, fontColor,
                         info.Bold, info.Italic, info.HAlign, info.VAlign,
-                        info.TextRotation, info.IsTagLink, excelRow, excelCol);
-                    _cellBorders[(excelRow, excelCol)] = border;
+                        info.TextRotation, info.IsTagLink, excelRow, excelCol, isInteractiveCell);
+                    if (isInteractiveCell || info.IsPinkZone)
+                        _cellBorders[(excelRow, excelCol)] = border;
 
                     if (info.IsPinkZone)
                     {
                         int captRow = excelRow, captCol = excelCol;
                         var tap = new TapGestureRecognizer();
-                        tap.Tapped += async (_, _) => await TogglePinkAsync(captRow, captCol);
+                        tap.Tapped += async (_, _) =>
+                        {
+                            Log($"Tap détecté sur cellule pink-zone ({captRow},{captCol})");
+                            await TogglePinkAsync(captRow, captCol);
+                        };
                         border.GestureRecognizers.Add(tap);
                     }
-                    else if (excelCol == ColF && excelRow >= RowTagMin && !string.IsNullOrWhiteSpace(info.Text))
+                    else if (isFRowToggleCell)
                     {
                         int captRow = excelRow;
                         int captRowSpan = info.RowSpan;
                         var tap = new TapGestureRecognizer();
-                        tap.Tapped += async (_, _) => await ToggleFNeighborColumnsAsync(captRow, captRowSpan);
+                        tap.Tapped += async (_, _) =>
+                        {
+                            Log($"Tap détecté sur cellule F-toggle (ligne {captRow})");
+                            await ToggleFNeighborColumnsAsync(captRow, captRowSpan);
+                        };
                         border.GestureRecognizers.Add(tap);
                     }
                     else if (info.IsTagLink)
@@ -531,7 +635,7 @@ namespace ExcelClosedXML
                     Grid.SetColumn(border, ci);
                     Grid.SetRow(border, gridRow);
                     if (info.ColSpan > 1) Grid.SetColumnSpan(border, info.ColSpan);
-                    if (info.RowSpan  > 1) Grid.SetRowSpan(border,   info.RowSpan);
+                    if (info.RowSpan > 1) Grid.SetRowSpan(border, info.RowSpan);
                     target.Add(border);
                 }
             }
@@ -544,10 +648,16 @@ namespace ExcelClosedXML
         {
             // Optimisation Android : ignorer les clics multiples rapides
             if (!ShouldProcessCellClick(row, col))
+            {
+                Log($"TogglePinkAsync({row},{col}) ignoré par debounce");
                 return;
+            }
 
             if (_worksheet == null || _workbook == null || _fileInfo == null)
+            {
+                Log($"TogglePinkAsync({row},{col}) abandonné : worksheet/workbook/fileInfo null");
                 return;
+            }
 
             var key = (row, col);
             bool isPink = _pinkCells.Contains(key);
@@ -558,8 +668,8 @@ namespace ExcelClosedXML
                 border.BackgroundColor = isPink ? CellWhite : CellPink;
 
                 // Animation rapide de feedback : scale + fade
-                _ = border.ScaleTo(1.05, 100, Easing.CubicOut);
-                _ = border.ScaleTo(1.0, 100, Easing.CubicIn);
+                _ = border.ScaleToAsync(1.05, 100, Easing.CubicOut);
+                _ = border.ScaleToAsync(1.0, 100, Easing.CubicIn);
             }
 
             // Mise à jour du cache local
@@ -580,10 +690,11 @@ namespace ExcelClosedXML
                         cell.Style.Fill.BackgroundColor = XLColor.Pink;
                 });
 
-                await QueueAutoSaveAsync();
+                MarkWorkbookDirty();
             }
-            catch
+            catch (Exception ex)
             {
+                Log($"EXCEPTION dans TogglePinkAsync({row},{col}) : {ex}");
                 // Rollback UI en cas d'échec
                 if (border != null)
                 {
@@ -664,10 +775,11 @@ namespace ExcelClosedXML
                     }
                 });
 
-                await QueueAutoSaveAsync();
+                MarkWorkbookDirty();
             }
-            catch
+            catch (Exception ex)
             {
+                Log($"EXCEPTION dans ToggleFNeighborColumnsAsync(ligne {row}) : {ex}");
                 // Rollback UI en cas d'échec
                 foreach (var (border, color) in bordersBackup)
                 {
@@ -834,11 +946,8 @@ namespace ExcelClosedXML
         private async void OnTagCellTapped(string cellText)
         {
             // Feedback immédiat sur Android : visual cue que le clic a été reçu
-            MainThread.BeginInvokeOnMainThread(() =>
-            {
-                StatusLabel.IsVisible = true;
-                StatusLabel.Text = "Ouverture du fichier...";
-            });
+            StatusLabel.IsVisible = true;
+            StatusLabel.Text = "Ouverture du fichier...";
 
             if (_fileInfo?.SourceDocumentUri == null && _fileInfo?.Directory == null)
             {
@@ -897,6 +1006,27 @@ namespace ExcelClosedXML
                 }
             }
 
+            if (_fileInfo?.Directory != null)
+            {
+                var autoResolvedPath = FindTagFileInSmbCache(_fileInfo.Directory, cellText, extensions);
+                if (autoResolvedPath != null)
+                {
+                    try
+                    {
+                        await _tagFileOpener.OpenTagFileAsync(autoResolvedPath, accessUri);
+                        return;
+                    }
+                    catch (FileNotFoundException)
+                    {
+                    }
+                    catch (Exception ex)
+                    {
+                        await DisplayAlertAsync("Erreur", $"Impossible d'ouvrir le fichier :\n{ex.Message}", "OK");
+                        return;
+                    }
+                }
+            }
+
             await DisplayAlertAsync("Fichier introuvable",
                 $"Aucun fichier correspondant à \"{cellText}\" n'a été trouvé dans le dossier fichiers.",
                 "OK");
@@ -905,13 +1035,19 @@ namespace ExcelClosedXML
         private static string? FindSuffixedFilePath(string baseDirectory, string cellText, string extension)
         {
             var folderPath = Path.Combine(baseDirectory, "fichiers");
+            return FindSuffixedFilePathInFolder(folderPath, cellText, extension);
+        }
+
+        private static string? FindSuffixedFilePathInFolder(string folderPath, string cellText, string extension)
+        {
             if (!Directory.Exists(folderPath))
                 return null;
 
             var prefix = cellText + "-";
             string? selectedFile = null;
+            var searchPattern = prefix + "*" + extension;
 
-            foreach (var filePath in Directory.EnumerateFiles(folderPath, "*" + extension, SearchOption.TopDirectoryOnly))
+            foreach (var filePath in Directory.EnumerateFiles(folderPath, searchPattern, SearchOption.TopDirectoryOnly))
             {
                 var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(filePath);
                 if (!fileNameWithoutExtension.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
@@ -927,34 +1063,102 @@ namespace ExcelClosedXML
             return selectedFile;
         }
 
-        // ── Sauvegarde ────────────────────────────────────────────────────────
-        private async void OnSaveClicked(object sender, EventArgs e)
+        private static string? FindTagFileInSmbCache(string baseDirectory, string cellText, string[] extensions)
         {
-            if (_workbook == null || _worksheet == null || _fileInfo == null) return;
+            foreach (var root in EnumerateSmbSearchRoots(baseDirectory))
+            {
+                foreach (var directory in EnumerateDirectoriesSafe(root))
+                {
+                    if (!string.Equals(Path.GetFileName(directory), "fichiers", StringComparison.OrdinalIgnoreCase))
+                        continue;
 
-            try
-            {
-                var savePath = await SaveWorkbookAsync();
-                await DisplayAlertAsync("Enregistré",
-                    $"Fichier sauvegardé :\n{savePath}", "OK");
+                    foreach (var extension in extensions)
+                    {
+                        var exactPath = Path.Combine(directory, cellText + extension);
+                        if (File.Exists(exactPath))
+                            return exactPath;
+
+                        var suffixedPath = FindSuffixedFilePathInFolder(directory, cellText, extension);
+                        if (suffixedPath != null)
+                            return suffixedPath;
+                    }
+                }
             }
-            catch (Exception ex)
+
+            return null;
+        }
+
+        private static IEnumerable<string> EnumerateSmbSearchRoots(string baseDirectory)
+        {
+            var yielded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (!string.IsNullOrWhiteSpace(baseDirectory) && yielded.Add(baseDirectory))
+                yield return baseDirectory;
+
+            var parent = Directory.GetParent(baseDirectory)?.FullName;
+            if (!string.IsNullOrWhiteSpace(parent) && yielded.Add(parent))
+                yield return parent;
+
+            var marker = $"{Path.DirectorySeparatorChar}.localcache{Path.DirectorySeparatorChar}SMB{Path.DirectorySeparatorChar}";
+            int markerIndex = baseDirectory.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+            if (markerIndex >= 0)
             {
-                await DisplayAlertAsync("Erreur d'enregistrement", ex.Message, "OK");
+                var smbRoot = baseDirectory.Substring(0, markerIndex + marker.Length);
+                if (!string.IsNullOrWhiteSpace(smbRoot) && yielded.Add(smbRoot))
+                    yield return smbRoot;
             }
         }
 
+        private static IEnumerable<string> EnumerateDirectoriesSafe(string rootDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(rootDirectory) || !Directory.Exists(rootDirectory))
+                yield break;
+
+            var pending = new Stack<string>();
+            pending.Push(rootDirectory);
+
+            while (pending.Count > 0)
+            {
+                var current = pending.Pop();
+                yield return current;
+
+                string[] childDirectories;
+                try
+                {
+                    childDirectories = Directory.GetDirectories(current);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                foreach (var child in childDirectories)
+                    pending.Push(child);
+            }
+        }
+
+        // ── Sauvegarde ────────────────────────────────────────────────────────
         private async Task<string?> SaveWorkbookAsync()
         {
             if (_workbook == null || _fileInfo == null || _worksheet == null)
+            {
+                Log("SaveWorkbookAsync() abandonné : _workbook/_fileInfo/_worksheet null");
                 return null;
+            }
+
+            Log($"SaveWorkbookAsync() démarre pour {_fileInfo.FileName} (Directory={_fileInfo.Directory}, SourceDocumentUri={_fileInfo.SourceDocumentUri})");
 
             await _saveLock.WaitAsync();
             try
             {
-                await using var workbookBuffer = new MemoryStream();
+                var initialCapacity = _workbookStream is { Length: > 0 and <= int.MaxValue }
+                    ? (int)_workbookStream.Length
+                    : 256 * 1024;
+
+                await using var workbookBuffer = new MemoryStream(initialCapacity);
                 _workbook.SaveAs(workbookBuffer);
                 var payload = workbookBuffer.ToArray();
+                Log($"Workbook sérialisé en mémoire : {payload.Length} octets");
 
                 var savedPath = await _workbookStorageService.SaveAsync(
                     _fileInfo,
@@ -963,6 +1167,8 @@ namespace ExcelClosedXML
                         stream.Write(payload, 0, payload.Length);
                         stream.Flush();
                     });
+
+                Log($"_workbookStorageService.SaveAsync() a retourné : '{savedPath}'");
 
                 var replacementStream = new MemoryStream(payload, writable: true);
                 var replacementWorkbook = new XLWorkbook(replacementStream);
@@ -982,6 +1188,7 @@ namespace ExcelClosedXML
             }
             catch (Exception ex)
             {
+                Log($"EXCEPTION dans SaveWorkbookAsync() : {ex}");
                 await MainThread.InvokeOnMainThreadAsync(() =>
                 {
                     StatusLabel.Text = $"Sauvegarde impossible : {ex.Message}";
@@ -995,24 +1202,6 @@ namespace ExcelClosedXML
             }
         }
 
-        private async Task QueueAutoSaveAsync()
-        {
-            _autoSaveCts?.Cancel();
-            _autoSaveCts?.Dispose();
-
-            var cts = new CancellationTokenSource();
-            _autoSaveCts = cts;
-
-            try
-            {
-                await Task.Delay(350, cts.Token);
-                await SaveWorkbookAsync();
-            }
-            catch (OperationCanceledException)
-            {
-            }
-        }
-
         private async void OnBackClicked(object sender, EventArgs e)
             => await Shell.Current.GoToAsync("..");
 
@@ -1021,15 +1210,16 @@ namespace ExcelClosedXML
         {
             BackgroundColor = CellHeader,
             StrokeThickness = 1,
-            Stroke          = new SolidColorBrush(CellBorderClr),
-            Padding         = new Thickness(4, 0),
-            Content         = new Label
+            Stroke = CellBorderBrush,
+            Padding = new Thickness(4, 0),
+            Content = new Label
             {
-                Text                    = text,
-                FontAttributes          = FontAttributes.Bold,
-                FontSize                = 12,
-                VerticalOptions         = LayoutOptions.Center,
-                HorizontalOptions       = LayoutOptions.Center,
+                Text = text,
+                FontAttributes = FontAttributes.Bold,
+                FontSize = 12,
+                VerticalOptions = LayoutOptions.Fill,
+                HorizontalOptions = LayoutOptions.Fill,
+                VerticalTextAlignment = TextAlignment.Center,
                 HorizontalTextAlignment = TextAlignment.Center
             }
         };
@@ -1037,48 +1227,78 @@ namespace ExcelClosedXML
         private static Border MakeDataCell(string text, Color bgColor, Color fontColor,
             bool bold, bool italic,
             XLAlignmentHorizontalValues hAlign, XLAlignmentVerticalValues vAlign,
-            int textRotation, bool isLink, int excelRow, int excelCol)
+            int textRotation, bool isLink, int excelRow, int excelCol, bool isInteractive)
         {
             bool isCompactHeaderCell = excelRow == FreezeRow
                 && excelCol >= ColGStart
                 && excelCol <= ColDisplayLast;
+            bool isVerticalHeaderCell = isCompactHeaderCell;
 
             // 255 = texte empilé vertical (stacked), 90 = tourné 90° anti-horaire
             // MAUI Rotation : sens horaire positif → 90° anti-horaire = -90 ou 270
             double rotation = textRotation == 255 ? -90
-                            : textRotation > 0    ? -textRotation
+                            : textRotation > 0 ? -textRotation
                             : 0;
 
             bool isVertical = rotation != 0;
+            bool hasVisibleText = !string.IsNullOrWhiteSpace(text);
+            var effectiveFontColor = isCompactHeaderCell ? Colors.Black : fontColor;
+            var displayText = isVerticalHeaderCell ? FormatCompactHeaderText(text) : text;
+            var effectiveBackgroundColor = isCompactHeaderCell ? CellPink : bgColor;
+            var effectiveRotation = isCompactHeaderCell ? 0 : rotation;
+
+            if (!hasVisibleText && !isInteractive && !isVertical)
+            {
+                return new Border
+                {
+                    BackgroundColor = effectiveBackgroundColor,
+                    StrokeThickness = 1,
+                    Stroke = CellBorderBrush,
+                    Padding = Thickness.Zero,
+                    InputTransparent = true
+                };
+            }
 
             var label = new Label
             {
-                Text            = text,
-                FontSize        = isCompactHeaderCell ? 10 : 12,
-                TextColor       = fontColor,
+                Text = displayText,
+                FontSize = isCompactHeaderCell ? 9 : 12,
+                TextColor = effectiveFontColor,
                 TextDecorations = isLink ? TextDecorations.Underline : TextDecorations.None,
-                FontAttributes  = (bold ? FontAttributes.Bold : FontAttributes.None)
+                FontAttributes = (bold ? FontAttributes.Bold : FontAttributes.None)
                                 | (italic ? FontAttributes.Italic : FontAttributes.None),
-                VerticalOptions         = isCompactHeaderCell ? LayoutOptions.Fill : LayoutOptions.Center,
-                HorizontalOptions       = isCompactHeaderCell ? LayoutOptions.Fill : LayoutOptions.Center,
-                VerticalTextAlignment   = TextAlignment.Center,
-                HorizontalTextAlignment = hAlign == XLAlignmentHorizontalValues.Right  ? TextAlignment.End
-                                        : hAlign == XLAlignmentHorizontalValues.Center ? TextAlignment.Center
-                                        : TextAlignment.Start,
-                Rotation        = rotation,
-                LineBreakMode   = isVertical
-                    ? LineBreakMode.NoWrap
-                    : isCompactHeaderCell ? LineBreakMode.CharacterWrap : LineBreakMode.WordWrap
+                VerticalOptions = LayoutOptions.Fill,
+                HorizontalOptions = LayoutOptions.Fill,
+                VerticalTextAlignment = TextAlignment.Center,
+                HorizontalTextAlignment = TextAlignment.Center,
+                Rotation = effectiveRotation,
+                InputTransparent = true,
+                LineBreakMode = LineBreakMode.WordWrap,
+                MaxLines = isVerticalHeaderCell ? 32 : -1
             };
 
             return new Border
             {
-                BackgroundColor = bgColor,
+                BackgroundColor = effectiveBackgroundColor,
                 StrokeThickness = 1,
-                Stroke          = new SolidColorBrush(CellBorderClr),
-                Padding         = isCompactHeaderCell ? new Thickness(1, 0) : new Thickness(2),
-                Content         = label
+                Stroke = CellBorderBrush,
+                Padding = isCompactHeaderCell ? new Thickness(0, 2) : new Thickness(2),
+                InputTransparent = !isInteractive && !isCompactHeaderCell,
+                Content = label
             };
+        }
+
+        private static string FormatCompactHeaderText(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return string.Empty;
+
+            var compact = text.Replace(" ", string.Empty)
+                              .Replace("/", string.Empty)
+                              .Replace("\r", string.Empty)
+                              .Replace("\n", string.Empty);
+
+            return string.Join(Environment.NewLine, compact.ToCharArray());
         }
 
         // ── Helpers utilitaires ───────────────────────────────────────────────

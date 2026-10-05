@@ -1,7 +1,13 @@
 ﻿using Android.Content;
 using Android.Provider;
 using ExcelClosedXML.Services;
+using Microsoft.Maui.ApplicationModel;
+using System.Linq;
 using AndroidApp = Android.App.Application;
+using SMBLibrary;
+using SMBLibrary.Client;
+using SMBLibrary.SMB2;
+using System.Net;
 using XFileProvider = AndroidX.Core.Content.FileProvider;
 
 namespace ExcelClosedXML.Droid.Services
@@ -11,9 +17,9 @@ namespace ExcelClosedXML.Droid.Services
     ///
     /// Acces au .tag sur Android 10+ (Scoped Storage) :
     ///   1. TreeUri : utilise l URI d arborescence accorde via OPEN_DOCUMENT_TREE
-    ///                => DocumentsContract.BuildDocumentUriUsingTree  (methode recommandee)
+    ///                → DocumentsContract.BuildDocumentUriUsingTree  (methode recommandee)
     ///   2. DocumentsContract sans tree (fallback)
-    ///   3. File.Copy direct (Android <= 9 uniquement)
+    ///   3. File.Copy direct (Android &lt;= 9 uniquement)
     /// </summary>
     public class AndroidTagFileOpener : ITagFileOpener
     {
@@ -32,11 +38,20 @@ namespace ExcelClosedXML.Droid.Services
 
                 bool copied = false;
 
-                if (sourceDocumentUri != null)
+                if (isTagFile)
+                {
+                    var smbSettings = await SmbSettingsStore.LoadAsync();
+                    copied = await TryCopySmbFileAsync(smbSettings, fileName, cachePath);
+                }
+
+                if (!copied && sourceDocumentUri != null)
                     copied = await TryCopyViaTreeUri(context, sourceDocumentUri, fileName, cachePath);
 
                 if (!copied && sourceDocumentUri != null)
                     copied = await TryCopyViaDocumentUri(context, sourceDocumentUri, filePath, cachePath);
+
+                if (!copied && sourceDocumentUri != null)
+                    copied = await TryCopyViaSiblingProviderUri(context, sourceDocumentUri, fileName, cachePath);
 
                 if (!copied && File.Exists(filePath))
                 {
@@ -214,6 +229,303 @@ namespace ExcelClosedXML.Droid.Services
                 return true;
             }
             catch { return false; }
+        }
+
+        // ── Strategie 3 : URI sœur via provider tiers (ex: SMB file manager cache) ───
+        private static async Task<bool> TryCopyViaSiblingProviderUri(
+            Context context, string sourceDocUriString, string tagFileName, string cachePath)
+        {
+            try
+            {
+                var sourceUri = Android.Net.Uri.Parse(sourceDocUriString);
+                if (sourceUri == null) return false;
+
+                // Certains providers SMB exposent des URI de type fileprovider/root.
+                // Utiliser le chemin décodé puis Uri.Builder évite les URI invalides
+                // provoquées par la concaténation d'un chemin déjà encodé.
+                string? sourcePath = sourceUri.Path;
+                int lastSlash = sourcePath?.LastIndexOf('/') ?? -1;
+                if (lastSlash <= 0) return false;
+
+                var prefix = sourcePath!.Substring(0, lastSlash);
+                var candidates = new List<Android.Net.Uri>
+                {
+                    BuildProviderUri(sourceDocUriString, prefix + "/fichiers/" + tagFileName)
+                };
+
+                if (prefix.Contains("/root/", StringComparison.OrdinalIgnoreCase))
+                {
+                    var documentPrefix = prefix.Replace("/root/", "/document/", StringComparison.OrdinalIgnoreCase);
+                    candidates.Add(BuildProviderUri(sourceDocUriString, documentPrefix + "/fichiers/" + tagFileName));
+                }
+
+                foreach (var candidate in candidates)
+                {
+                    try
+                    {
+                        using var inputStream = context.ContentResolver?.OpenInputStream(candidate);
+                        if (inputStream == null)
+                            continue;
+
+                        await using var output = File.Create(cachePath);
+                        await inputStream.CopyToAsync(output);
+                        return true;
+                    }
+                    catch
+                    {
+                        // essaie la prochaine variante
+                    }
+                }
+
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static Android.Net.Uri BuildProviderUri(string sourceUriString, string decodedPath)
+        {
+            var encodedPath = Android.Net.Uri.Encode(decodedPath, "/");
+            int schemeSeparator = sourceUriString.IndexOf("://", StringComparison.Ordinal);
+            if (schemeSeparator <= 0)
+                throw new ArgumentException("URI source invalide.", nameof(sourceUriString));
+
+            int authorityStart = schemeSeparator + 3;
+            int authorityEnd = sourceUriString.IndexOf('/', authorityStart);
+            if (authorityEnd <= authorityStart)
+                throw new ArgumentException("URI source sans autorité.", nameof(sourceUriString));
+
+            var prefix = sourceUriString.Substring(0, authorityStart);
+            var authority = sourceUriString.Substring(authorityStart, authorityEnd - authorityStart);
+            return Android.Net.Uri.Parse($"{prefix}{authority}{encodedPath}")!;
+        }
+
+        private static Task<bool> TryCopySmbFileAsync(
+            SmbSettings settings, string fileName, string cachePath)
+        {
+            return Task.Run(() =>
+            {
+                ISMBClient? client = null;
+                ISMBFileStore? store = null;
+                object? fileHandle = null;
+
+                try
+                {
+                    var userName = string.IsNullOrWhiteSpace(settings.UserName)
+                        ? string.Empty
+                        : settings.UserName;
+                    var (loginStatus, connectedClient) = SmbSettingsStore.TryConnectAndLoginWithFallbacks(
+                        IPAddress.Parse(settings.ServerAddress),
+                        userName,
+                        settings.Password ?? string.Empty);
+                    client = connectedClient;
+                    if (loginStatus != NTStatus.STATUS_SUCCESS || client == null)
+                    {
+                        // Repli pour les serveurs qui acceptent une session anonyme vide.
+                        client = new SMB2Client();
+                        if (!client.Connect(IPAddress.Parse(settings.ServerAddress), SMBTransportType.DirectTCPTransport))
+                            return false;
+
+                        loginStatus = client.Login(string.Empty, string.Empty, string.Empty);
+                        if (loginStatus != NTStatus.STATUS_SUCCESS)
+                            return false;
+                    }
+
+                    store = client.TreeConnect(settings.Share, out var treeStatus);
+                    if (treeStatus != NTStatus.STATUS_SUCCESS || store == null)
+                        return false;
+
+                    var remotePath = settings.Path;
+                    if (!string.IsNullOrEmpty(remotePath))
+                        remotePath = remotePath.Replace('/', '\\').Trim('\\') + "\\";
+                    remotePath += fileName;
+
+                    var status = store.CreateFile(
+                        out fileHandle,
+                        out _,
+                        remotePath,
+                        AccessMask.GENERIC_READ,
+                        SMBLibrary.FileAttributes.Normal,
+                        ShareAccess.Read | ShareAccess.Write,
+                        CreateDisposition.FILE_OPEN,
+                        CreateOptions.FILE_NON_DIRECTORY_FILE,
+                        null);
+
+                    if (status != NTStatus.STATUS_SUCCESS || fileHandle == null)
+                        return false;
+
+                    Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
+                    using var output = File.Create(cachePath);
+                    long offset = 0;
+                    const int blockSize = 64 * 1024;
+
+                    while (true)
+                    {
+                        status = store.ReadFile(out var data, fileHandle, offset, blockSize);
+                        if (status != NTStatus.STATUS_SUCCESS || data == null || data.Length == 0)
+                            break;
+
+                        output.Write(data, 0, data.Length);
+                        offset += data.Length;
+                        if (data.Length < blockSize)
+                            break;
+                    }
+
+                    return output.Length > 0;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    if (store != null && fileHandle != null)
+                    {
+                        try { store.CloseFile(fileHandle); } catch { }
+                    }
+
+                    try { client?.Logoff(); } catch { }
+                    try { client?.Disconnect(); } catch { }
+                }
+            });
+        }
+
+        public async Task<bool> TryPickAndOpenTagFileManuallyAsync(string cellText, string[] extensions)
+        {
+            try
+            {
+                var activity = Platform.CurrentActivity;
+                if (activity == null)
+                    return false;
+
+                var tcs = new TaskCompletionSource<Intent?>();
+                void Handler(Intent? data) { MainActivity.FilePickResult -= Handler; tcs.TrySetResult(data); }
+                MainActivity.FilePickResult += Handler;
+
+                var pickIntent = new Intent(Intent.ActionOpenDocument);
+                pickIntent.AddCategory(Intent.CategoryOpenable);
+                pickIntent.SetType("*/*");
+
+                var mimeTypes = new List<string>();
+                foreach (var extension in extensions)
+                {
+                    var mime = GetMimeType(extension);
+                    if (!mimeTypes.Contains(mime, StringComparer.OrdinalIgnoreCase))
+                        mimeTypes.Add(mime);
+                }
+
+                pickIntent.PutExtra(Intent.ExtraMimeTypes, mimeTypes.ToArray());
+                pickIntent.AddFlags(ActivityFlags.GrantReadUriPermission |
+                                    ActivityFlags.GrantWriteUriPermission |
+                                    ActivityFlags.GrantPersistableUriPermission);
+
+                try
+                {
+                    var chooser = Intent.CreateChooser(pickIntent, $"Sélectionner le fichier {cellText}");
+                    activity.StartActivityForResult(chooser, AndroidFilePickerService.RequestCode);
+                }
+                catch
+                {
+                    MainActivity.FilePickResult -= Handler;
+                    return false;
+                }
+
+                var resultIntent = await tcs.Task;
+                var fileUri = resultIntent?.Data;
+                if (fileUri == null)
+                    return false;
+
+                TryTakePersistablePermissions(AndroidApp.Context, fileUri);
+
+                var fileName = GetDisplayName(AndroidApp.Context, fileUri) ?? string.Empty;
+                var selectedExtension = Path.GetExtension(fileName);
+                if (!extensions.Any(ext => string.Equals(ext, selectedExtension, StringComparison.OrdinalIgnoreCase)))
+                    return false;
+
+                var selectedBaseName = Path.GetFileNameWithoutExtension(fileName);
+                if (!string.Equals(selectedBaseName, cellText, StringComparison.OrdinalIgnoreCase)
+                    && !selectedBaseName.StartsWith(cellText + "-", StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+
+                await OpenPickedFileUriAsync(AndroidApp.Context, fileUri, selectedExtension);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static async Task OpenPickedFileUriAsync(Context context, Android.Net.Uri fileUri, string extension)
+        {
+            await Task.Yield();
+
+            var isTagFile = string.Equals(extension, ".tag", StringComparison.OrdinalIgnoreCase);
+            var mimeType = GetMimeType(extension);
+
+            var intent = new Intent(Intent.ActionView);
+            intent.SetDataAndType(fileUri, mimeType);
+            intent.AddFlags(ActivityFlags.GrantReadUriPermission
+                          | ActivityFlags.GrantWriteUriPermission
+                          | ActivityFlags.NewTask);
+
+            var preferredPackage = isTagFile ? FindApk4TagPackage(context.PackageManager!) : null;
+            if (!string.IsNullOrWhiteSpace(preferredPackage))
+                intent.SetPackage(preferredPackage);
+
+            try
+            {
+                context.StartActivity(intent);
+                return;
+            }
+            catch (ActivityNotFoundException)
+            {
+                var fallbackIntent = new Intent(Intent.ActionView);
+                fallbackIntent.SetDataAndType(fileUri, "*/*");
+                fallbackIntent.AddFlags(ActivityFlags.GrantReadUriPermission
+                                      | ActivityFlags.GrantWriteUriPermission
+                                      | ActivityFlags.NewTask);
+
+                if (!string.IsNullOrWhiteSpace(preferredPackage))
+                    fallbackIntent.SetPackage(preferredPackage);
+
+                context.StartActivity(fallbackIntent);
+            }
+        }
+
+        private static void TryTakePersistablePermissions(Context context, Android.Net.Uri uri)
+        {
+            try
+            {
+                context.ContentResolver?.TakePersistableUriPermission(uri,
+                    ActivityFlags.GrantReadUriPermission | ActivityFlags.GrantWriteUriPermission);
+            }
+            catch
+            {
+            }
+        }
+
+        private static string? GetDisplayName(Context context, Android.Net.Uri uri)
+        {
+            try
+            {
+                string[] projection = { IOpenableColumns.DisplayName };
+                using var cursor = context.ContentResolver?.Query(uri, projection, null, null, null);
+                if (cursor?.MoveToFirst() == true)
+                {
+                    int idx = cursor.GetColumnIndex(IOpenableColumns.DisplayName);
+                    if (idx >= 0) return cursor.GetString(idx);
+                }
+            }
+            catch
+            {
+            }
+
+            return null;
         }
     }
 }
