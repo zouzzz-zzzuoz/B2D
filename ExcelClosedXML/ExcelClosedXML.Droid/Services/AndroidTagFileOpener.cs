@@ -38,11 +38,8 @@ namespace ExcelClosedXML.Droid.Services
 
                 bool copied = false;
 
-                if (isTagFile)
-                {
-                    var smbSettings = await SmbSettingsStore.LoadAsync();
-                    copied = await TryCopySmbFileAsync(smbSettings, fileName, cachePath);
-                }
+                var smbSettings = await SmbSettingsStore.LoadAsync();
+                copied = await TryCopySmbFileAsync(smbSettings, fileName, cachePath);
 
                 if (!copied && sourceDocumentUri != null)
                     copied = await TryCopyViaTreeUri(context, sourceDocumentUri, fileName, cachePath);
@@ -337,10 +334,11 @@ namespace ExcelClosedXML.Droid.Services
                     if (treeStatus != NTStatus.STATUS_SUCCESS || store == null)
                         return false;
 
-                    var remotePath = settings.Path;
-                    if (!string.IsNullOrEmpty(remotePath))
-                        remotePath = remotePath.Replace('/', '\\').Trim('\\') + "\\";
-                    remotePath += fileName;
+                    var remoteDirectory = settings.Path ?? string.Empty;
+                    if (!string.IsNullOrEmpty(remoteDirectory))
+                        remoteDirectory = remoteDirectory.Replace('/', '\\').Trim('\\');
+
+                    var remotePath = BuildSmbPath(remoteDirectory, fileName);
 
                     var status = store.CreateFile(
                         out fileHandle,
@@ -354,7 +352,35 @@ namespace ExcelClosedXML.Droid.Services
                         null);
 
                     if (status != NTStatus.STATUS_SUCCESS || fileHandle == null)
-                        return false;
+                    {
+                        if (fileHandle != null)
+                        {
+                            try { store.CloseFile(fileHandle); } catch { }
+                            fileHandle = null;
+                        }
+
+                        var suffixedFileName = FindSuffixedSmbFileName(
+                            store,
+                            remoteDirectory,
+                            fileName);
+                        if (string.IsNullOrWhiteSpace(suffixedFileName))
+                            return false;
+
+                        remotePath = BuildSmbPath(remoteDirectory, suffixedFileName);
+                        status = store.CreateFile(
+                            out fileHandle,
+                            out _,
+                            remotePath,
+                            AccessMask.GENERIC_READ,
+                            SMBLibrary.FileAttributes.Normal,
+                            ShareAccess.Read | ShareAccess.Write,
+                            CreateDisposition.FILE_OPEN,
+                            CreateOptions.FILE_NON_DIRECTORY_FILE,
+                            null);
+
+                        if (status != NTStatus.STATUS_SUCCESS || fileHandle == null)
+                            return false;
+                    }
 
                     Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
                     using var output = File.Create(cachePath);
@@ -390,6 +416,70 @@ namespace ExcelClosedXML.Droid.Services
                     try { client?.Disconnect(); } catch { }
                 }
             });
+        }
+
+        private static string BuildSmbPath(string remoteDirectory, string fileName)
+        {
+            return string.IsNullOrEmpty(remoteDirectory)
+                ? fileName
+                : remoteDirectory.TrimEnd('\\') + "\\" + fileName;
+        }
+
+        private static string? FindSuffixedSmbFileName(
+            ISMBFileStore store, string remoteDirectory, string requestedFileName)
+        {
+            var baseName = Path.GetFileNameWithoutExtension(requestedFileName);
+            var extension = Path.GetExtension(requestedFileName);
+            if (string.IsNullOrWhiteSpace(baseName) || string.IsNullOrWhiteSpace(extension))
+                return null;
+
+            var prefix = baseName + "-";
+            object? directoryHandle = null;
+
+            try
+            {
+                var status = store.CreateFile(
+                    out directoryHandle,
+                    out _,
+                    remoteDirectory,
+                    AccessMask.GENERIC_READ,
+                    SMBLibrary.FileAttributes.Directory,
+                    ShareAccess.Read | ShareAccess.Write,
+                    CreateDisposition.FILE_OPEN,
+                    CreateOptions.FILE_DIRECTORY_FILE,
+                    null);
+                if (status != NTStatus.STATUS_SUCCESS || directoryHandle == null)
+                    return null;
+
+                status = store.QueryDirectory(
+                    out var entries,
+                    directoryHandle,
+                    prefix + "*",
+                    FileInformationClass.FileDirectoryInformation);
+                if ((status != NTStatus.STATUS_SUCCESS
+                     && status != NTStatus.STATUS_NO_MORE_FILES)
+                    || entries == null)
+                    return null;
+
+                return entries
+                    .Select(entry => ((FileDirectoryInformation)entry).FileName)
+                    .Where(name => name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(Path.GetExtension(name), extension,
+                            StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+                    .FirstOrDefault();
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                if (directoryHandle != null)
+                {
+                    try { store.CloseFile(directoryHandle); } catch { }
+                }
+            }
         }
 
         public async Task<bool> TryPickAndOpenTagFileManuallyAsync(string cellText, string[] extensions)

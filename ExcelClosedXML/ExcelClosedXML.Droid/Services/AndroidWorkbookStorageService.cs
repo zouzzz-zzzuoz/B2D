@@ -30,6 +30,27 @@ namespace ExcelClosedXML.Droid.Services
 
         public async Task<Stream?> OpenReadAsync(ExcelFileInfo fileInfo, CancellationToken cancellationToken = default)
         {
+            var stream = await OpenReadCoreAsync(fileInfo, cancellationToken);
+
+            // Met à jour l'Hôte SMB (dossier du .xlsx ouvert + "/fichiers") en arrière-plan.
+            try
+            {
+                if (stream != null && !string.IsNullOrWhiteSpace(fileInfo.FileName))
+                {
+                    long size = stream.CanSeek ? stream.Length : 0;
+                    SmbSettingsStore.BeginUpdateHostForOpenedFile(fileInfo.FileName, size, fileInfo.Directory);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"BeginUpdateHost : EXCEPTION (ignorée) : {ex.Message}");
+            }
+
+            return stream;
+        }
+
+        private async Task<Stream?> OpenReadCoreAsync(ExcelFileInfo fileInfo, CancellationToken cancellationToken)
+        {
             if (fileInfo.Stream != null)
             {
                 if (fileInfo.Stream.CanSeek)
@@ -84,6 +105,9 @@ namespace ExcelClosedXML.Droid.Services
             // serveur SMB. On écrit ici nous-mêmes, directement sur le partage.
             try
             {
+                // Laisse finir la mise à jour de l'Hôte lancée à l'ouverture du fichier.
+                await SmbSettingsStore.WaitForPendingHostUpdateAsync();
+
                 var smbSettings = await SmbSettingsStore.LoadAsync();
                 if (!string.IsNullOrWhiteSpace(smbSettings.Server) && !string.IsNullOrWhiteSpace(fileInfo.FileName))
                 {
