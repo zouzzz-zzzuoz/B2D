@@ -38,12 +38,20 @@
                     <Label Text="Anonyme" FontSize="14" VerticalTextAlignment="Center" />
                 </HorizontalStackLayout>
 
-                
+                <!-- Résultat du test de connexion (vert / rouge) -->
                 <Label x:Name="StatusLabel"
                        Text=""
                        IsVisible="False"
                        FontAttributes="Bold"
                        Margin="0,8,0,0" />
+
+                <!-- Débit lecture / écriture, sous le texte de connexion -->
+                <Label x:Name="SpeedLabel"
+                       Text=""
+                       IsVisible="False"
+                       FontSize="15"
+                       Margin="0,-8,0,0"
+                       TextColor="{AppThemeBinding Light=#1565C0, Dark=#64B5F6}" />
             </VerticalStackLayout>
         </ScrollView>
 

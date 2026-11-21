@@ -1,4 +1,5 @@
 ﻿using System.Globalization;
+using System.Reflection;
 using ExcelClosedXML.Services;
 
 namespace ExcelClosedXML
@@ -19,12 +20,25 @@ namespace ExcelClosedXML
         private static string CreateBuildInfoText()
         {
             var culture = CultureInfo.GetCultureInfo("fr-FR");
-            var assemblyPath = typeof(App).Assembly.Location;
-            var buildTime = !string.IsNullOrWhiteSpace(assemblyPath) && File.Exists(assemblyPath)
+            var assembly = typeof(App).Assembly;
+
+            var buildTimestampUtc = assembly
+                .GetCustomAttributes<AssemblyMetadataAttribute>()
+                .FirstOrDefault(a => a.Key == "BuildTimestampUtc")
+                ?.Value;
+
+            if (DateTimeOffset.TryParse(buildTimestampUtc, CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var dto))
+            {
+                return dto.LocalDateTime.ToString("'le' dd/MM/yy 'à' HH'h'mm'm'ss's'", culture);
+            }
+
+            var assemblyPath = assembly.Location;
+            var fallbackBuildTime = !string.IsNullOrWhiteSpace(assemblyPath) && File.Exists(assemblyPath)
                 ? File.GetLastWriteTime(assemblyPath)
                 : Directory.GetLastWriteTime(AppContext.BaseDirectory);
 
-            return buildTime.ToString("'le' dd/MM/yy 'à' HH'h'mm'm'ss's'", culture);
+            return fallbackBuildTime.ToString("'le' dd/MM/yy 'à' HH'h'mm'm'ss's'", culture);
         }
 
         private async void OnOpenFileClicked(object? sender, EventArgs e)

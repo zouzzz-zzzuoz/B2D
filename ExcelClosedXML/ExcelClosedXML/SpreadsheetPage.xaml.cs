@@ -947,52 +947,31 @@ namespace ExcelClosedXML
         {
             // Feedback immédiat sur Android : visual cue que le clic a été reçu
             StatusLabel.IsVisible = true;
-            StatusLabel.Text = "Ouverture du fichier...";
+            StatusLabel.Text = $"Ouverture du fichier {cellText}…";
 
-            if (_fileInfo?.SourceDocumentUri == null && _fileInfo?.Directory == null)
+            try
             {
-                await DisplayAlertAsync("Répertoire inconnu",
-                    "Impossible de déterminer le répertoire du fichier source. " +
-                    "Vérifiez que le fichier est stocké sur le stockage interne du périphérique.",
-                    "OK");
-                return;
-            }
-
-            string basePath = _fileInfo?.Directory != null
-                ? Path.Combine(_fileInfo.Directory, "fichiers", cellText)
-                : Path.Combine("fichiers", cellText);
-
-            string? accessUri = _fileInfo?.TreeUri ?? _fileInfo?.SourceDocumentUri;
-            string[] extensions = [".tag", ".dxf", ".pdf", ".png", ".jpg", ".jpeg"];
-
-            foreach (var extension in extensions)
-            {
-                try
+                if (_fileInfo?.SourceDocumentUri == null && _fileInfo?.Directory == null)
                 {
-                    await _tagFileOpener.OpenTagFileAsync(basePath + extension, accessUri);
+                    await DisplayAlertAsync("Répertoire inconnu",
+                        "Impossible de déterminer le répertoire du fichier source. " +
+                        "Vérifiez que le fichier est stocké sur le stockage interne du périphérique.",
+                        "OK");
                     return;
                 }
-                catch (FileNotFoundException)
-                {
-                }
-                catch (Exception ex)
-                {
-                    await DisplayAlertAsync("Erreur", $"Impossible d'ouvrir le fichier :\n{ex.Message}", "OK");
-                    return;
-                }
-            }
 
-            if (_fileInfo?.Directory != null)
-            {
+                string basePath = _fileInfo?.Directory != null
+                    ? Path.Combine(_fileInfo.Directory, "fichiers", cellText)
+                    : Path.Combine("fichiers", cellText);
+
+                string? accessUri = _fileInfo?.TreeUri ?? _fileInfo?.SourceDocumentUri;
+                string[] extensions = [".tag", ".dxf", ".pdf", ".png", ".jpg", ".jpeg"];
+
                 foreach (var extension in extensions)
                 {
-                    var suffixedPath = FindSuffixedFilePath(_fileInfo.Directory, cellText, extension);
-                    if (suffixedPath == null)
-                        continue;
-
                     try
                     {
-                        await _tagFileOpener.OpenTagFileAsync(suffixedPath, accessUri);
+                        await _tagFileOpener.OpenTagFileAsync(basePath + extension, accessUri);
                         return;
                     }
                     catch (FileNotFoundException)
@@ -1004,32 +983,60 @@ namespace ExcelClosedXML
                         return;
                     }
                 }
-            }
 
-            if (_fileInfo?.Directory != null)
-            {
-                var autoResolvedPath = FindTagFileInSmbCache(_fileInfo.Directory, cellText, extensions);
-                if (autoResolvedPath != null)
+                if (_fileInfo?.Directory != null)
                 {
-                    try
+                    foreach (var extension in extensions)
                     {
-                        await _tagFileOpener.OpenTagFileAsync(autoResolvedPath, accessUri);
-                        return;
-                    }
-                    catch (FileNotFoundException)
-                    {
-                    }
-                    catch (Exception ex)
-                    {
-                        await DisplayAlertAsync("Erreur", $"Impossible d'ouvrir le fichier :\n{ex.Message}", "OK");
-                        return;
+                        var suffixedPath = FindSuffixedFilePath(_fileInfo.Directory, cellText, extension);
+                        if (suffixedPath == null)
+                            continue;
+
+                        try
+                        {
+                            await _tagFileOpener.OpenTagFileAsync(suffixedPath, accessUri);
+                            return;
+                        }
+                        catch (FileNotFoundException)
+                        {
+                        }
+                        catch (Exception ex)
+                        {
+                            await DisplayAlertAsync("Erreur", $"Impossible d'ouvrir le fichier :\n{ex.Message}", "OK");
+                            return;
+                        }
                     }
                 }
-            }
 
-            await DisplayAlertAsync("Fichier introuvable",
-                $"Aucun fichier correspondant à \"{cellText}\" n'a été trouvé dans le dossier fichiers.",
-                "OK");
+                if (_fileInfo?.Directory != null)
+                {
+                    var autoResolvedPath = FindTagFileInSmbCache(_fileInfo.Directory, cellText, extensions);
+                    if (autoResolvedPath != null)
+                    {
+                        try
+                        {
+                            await _tagFileOpener.OpenTagFileAsync(autoResolvedPath, accessUri);
+                            return;
+                        }
+                        catch (FileNotFoundException)
+                        {
+                        }
+                        catch (Exception ex)
+                        {
+                            await DisplayAlertAsync("Erreur", $"Impossible d'ouvrir le fichier :\n{ex.Message}", "OK");
+                            return;
+                        }
+                    }
+                }
+
+                await DisplayAlertAsync("Fichier introuvable",
+                    $"Aucun fichier correspondant à \"{cellText}\" n'a été trouvé dans le dossier fichiers.",
+                    "OK");
+            }
+            finally
+            {
+                StatusLabel.IsVisible = false;
+            }
         }
 
         private static string? FindSuffixedFilePath(string baseDirectory, string cellText, string extension)

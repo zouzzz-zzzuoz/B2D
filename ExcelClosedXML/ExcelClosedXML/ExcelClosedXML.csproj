@@ -8,6 +8,7 @@
 		<UseMaui>true</UseMaui>
 		<Nullable>enable</Nullable>
 		<ApplicationTitle>B2D</ApplicationTitle>
+		<BuildTimestampUtc>$([System.DateTime]::UtcNow.ToString("O"))</BuildTimestampUtc>
 
 		<!-- Enable XAML source generation for faster build times and improved performance.
 		     This generates C# code from XAML at compile time instead of runtime inflation.
@@ -35,6 +36,10 @@
 		<PackageReference Include="Microsoft.Maui.Controls" Version="$(MauiVersion)" />
 		<PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="10.0.0" />
 		<PackageReference Include="SMBLibrary" Version="1.5.5" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<AssemblyMetadata Include="BuildTimestampUtc" Value="$(BuildTimestampUtc)" />
 	</ItemGroup>
 
 	<ItemGroup>
